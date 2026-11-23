@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11,<3.13"
-# dependencies = ["earthaccess", "xarray", "h5netcdf", "h5py", "numpy", "pandas"]
+# dependencies = ["earthaccess", "obstore", "obspec-utils", "xarray", "h5netcdf", "h5py", "numpy", "pandas"]
 # ///
 """Is the SWOT L2 LR SSH Expert (version D) grid fixed cycle to cycle?
 
@@ -21,6 +21,8 @@ import earthaccess
 import numpy as np
 import pandas as pd
 import xarray as xr
+from obspec_utils.readers import EagerStoreReader
+from obstore.store import HTTPStore
 
 SHORT_NAME = "SWOT_L2_LR_SSH_EXPERT_D"
 SCIENCE_START = "2023-07-26"  # cycle 1 of the 21-day science orbit (Cal/Val excluded)
@@ -48,7 +50,7 @@ def pick_granules(pass_num):
         url = g.data_links(access="external")[0]
         m = NAME_RE.search(url)
         if m:
-            rows.append(dict(cycle=int(m[1]), crid=m[4], counter=int(m[5]), url=url, granule=g))
+            rows.append(dict(cycle=int(m[1]), crid=m[4], counter=int(m[5]), url=url))
     df = pd.DataFrame(rows)
     # one granule per cycle: latest product counter, prefer PGD (reprocessed) over PID
     df["crid_rank"] = df.crid.str.startswith("PGD").astype(int)
@@ -58,9 +60,14 @@ def pick_granules(pass_num):
     return df.iloc[idx]
 
 
-def read_coords(granule):
-    (f,) = earthaccess.open([granule], show_progress=False)
-    with xr.open_dataset(f, engine="h5netcdf") as ds:
+HTTPS_HOST = "https://archive.swot.podaac.earthdata.nasa.gov/"
+_store: HTTPStore | None = None  # set in __main__ once logged in
+
+
+def read_coords(url):
+    """Fetch the whole file (~35 MB) via obstore in parallel ranges; read the coords."""
+    reader = EagerStoreReader(_store, url.removeprefix(HTTPS_HOST))
+    with xr.open_dataset(reader, engine="h5netcdf") as ds:
         return {v: ds[v].values for v in VARS}
 
 
@@ -69,7 +76,7 @@ def check_pass(pass_num):
     print(f"\n=== pass {pass_num:03d}: cycles {sel.cycle.tolist()} "
           f"(crids {sorted(set(sel.crid))}) ===")
     with ThreadPoolExecutor(5) as ex:
-        coords = list(ex.map(read_coords, sel.granule))
+        coords = list(ex.map(read_coords, sel.url))
 
     shapes = {c["latitude"].shape for c in coords}
     print("swath shapes:", shapes)
@@ -98,6 +105,9 @@ def check_pass(pass_num):
 
 
 if __name__ == "__main__":
-    earthaccess.login(strategy="netrc")
+    token = earthaccess.login(strategy="netrc").token["access_token"]
+    _store = HTTPStore.from_url(
+        HTTPS_HOST, client_options={"default_headers": {"Authorization": f"Bearer {token}"}}
+    )
     for p in PASSES:
         check_pass(p)

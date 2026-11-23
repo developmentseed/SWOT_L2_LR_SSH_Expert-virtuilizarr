@@ -19,13 +19,21 @@ import earthaccess
 import numpy as np
 import xarray as xr
 
-from swot_cube import open_cube
+from obspec_utils.readers import EagerStoreReader
+
+from swot_cube import make_registry, open_cube
 
 
 def read_direct(url: str, token: str) -> xr.Dataset:
-    fs = earthaccess.get_fsspec_https_session()
-    f = fs.open(url)
-    return xr.open_dataset(f, engine="h5netcdf", drop_variables=["polarization_karin"]).load()
+    """Read a granule straight from the source file (no cube), via obstore.
+
+    EagerStoreReader fetches the whole file (~35 MB) in parallel range requests and
+    exposes it as a file-like object h5netcdf can open.
+    """
+    store, path = make_registry(token).resolve(url)
+    reader = EagerStoreReader(store, path)
+    with xr.open_dataset(reader, engine="h5netcdf", drop_variables=["polarization_karin"]) as ds:
+        return ds.load()
 
 
 def main(repo: str, samples: int) -> None:
