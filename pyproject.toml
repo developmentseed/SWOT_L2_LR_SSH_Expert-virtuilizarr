@@ -1,0 +1,25 @@
+[project]
+name = "swot-cube"
+version = "0.1.0"
+description = "Prototype virtual (cycle, pass) cube for SWOT L2 LR SSH Expert"
+readme = "README.md"
+authors = [
+    { name = "sharkinsspatial", email = "sharkinsgis@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "dask>=2026.8.0",
+    "earthaccess>=0.19.0",
+    "h5netcdf>=1.8.3",
+    "h5py>=3.16.0",
+    "icechunk>=2.3.1",
+    "numpy>=2.5.5",
+    "obstore>=0.12.1",
+    "pandas>=3.1.1",
+    "virtualizarr[hdf]>=2.8.0",
+    "xarray>=2026.9.0",
+]
+
+
+[tool.uv]
+package = false
