@@ -13,10 +13,17 @@ Each (cycle, pass_number) slot holds one granule; every variable is one chunk pe
 granule. Slots without a granule have no chunk references and read as fill values;
 use `granule_present` to tell a missing granule from masked data.
 
-Build model: write an empty template covering the full cube, then region-write one
-cycle at a time. Region writes skip empty references, so a hole never erases an
+Build model: write an empty template covering the full cube, then region-write
+runs of consecutive passes, located by coordinate labels (region="auto"). Blocks are
+assembled with expand_dims / combine_by_coords; the template uses empty manifests. Region writes skip empty references, so a hole never erases an
 existing reference. Granule coordinates in a written region are authoritative for
 that region.
+
+References are relative: every chunk location is stored as
+``vcc://podaac-swot/<key>`` and resolved through the virtual chunk container
+named ``podaac-swot``. The repo stores an S3 container under that name (no
+credentials); readers outside AWS override the same-named container with the
+HTTPS archive at open time. One store therefore serves S3 or HTTPS access.
 
 Science phase only (21-day orbit, 584 passes). Cal/Val data does not fit this axis.
 """
@@ -29,12 +36,16 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-import earthaccess
+import earthaccess  # CMR granule search only; auth comes from earthaccess-auth
+import earthaccess_auth
 import icechunk
 import numpy as np
 import pandas as pd
 import xarray as xr
 import zarr
+from earthaccess_auth import Auth
+from earthaccess_auth.adapters.icechunk import earthdata_containers_credentials
+from earthaccess_auth.adapters.obstore import http_client_options
 from obspec_utils.readers import BlockStoreReader, EagerStoreReader
 from obspec_utils.registry import ObjectStoreRegistry
 from obstore.store import HTTPStore
@@ -46,7 +57,11 @@ from virtualizarr.parsers import HDFParser
 SHORT_NAME = "SWOT_L2_LR_SSH_EXPERT_D"
 N_PASSES = 584
 HTTPS_HOST = "https://archive.swot.podaac.earthdata.nasa.gov/"
-HTTPS_PREFIX = HTTPS_HOST + "podaac-swot-ops-cumulus-protected/"
+S3_BUCKET = "podaac-swot-ops-cumulus-protected"
+HTTPS_PREFIX = HTTPS_HOST + S3_BUCKET + "/"
+S3_PREFIX = f"s3://{S3_BUCKET}/"
+VCC_NAME = "podaac-swot"            # container name; refs are relative to it
+VCC_ROOT = f"vcc://{VCC_NAME}/"
 DROP_VARS = ["polarization_karin"]  # fixed-length char array; not virtualizable
 GRID_VARS = ["latitude", "longitude"]  # stored once per pass (no cycle dim)
 LEAD = ("cycle", "pass_number")
@@ -116,15 +131,19 @@ def _rank(g: Granule) -> tuple[int, int]:
 
 # --------------------------------------------------------------------------- parsing
 
-def make_registry(token: str) -> ObjectStoreRegistry:
-    store = HTTPStore.from_url(
-        HTTPS_HOST, client_options={"default_headers": {"Authorization": f"Bearer {token}"}}
-    )
+def login(strategy: str = "netrc") -> Auth:
+    """Earthdata Login via earthaccess-auth (strategies: netrc, environment, interactive, all)."""
+    return earthaccess_auth.login(strategy=strategy)
+
+
+def make_registry(auth: Auth) -> ObjectStoreRegistry:
+    """obstore HTTPS store carrying the earthaccess-auth bearer header."""
+    store = HTTPStore.from_url(HTTPS_HOST, client_options=http_client_options(auth))
     return ObjectStoreRegistry({HTTPS_HOST: store})
 
 
 def parse_granules(
-    granules: list[Granule], token: str, workers: int = 8, eager: bool = True
+    granules: list[Granule], auth: Auth, workers: int = 8, eager: bool = True
 ) -> list[xr.Dataset]:
     """Parse granules into virtual datasets.
 
@@ -134,7 +153,7 @@ def parse_granules(
     (S3, low latency) the block reader avoids downloading whole files.
     Threads help only with eager: h5py's global lock serializes HDF5 parsing.
     """
-    registry = make_registry(token)
+    registry = make_registry(auth)
     reader = EagerStoreReader if eager else BlockStoreReader
     parser = HDFParser(drop_variables=DROP_VARS, reader_factory=reader)
 
@@ -142,7 +161,17 @@ def parse_granules(
         return open_virtual_dataset(g.url, registry=registry, parser=parser, loadable_variables=[])
 
     with ThreadPoolExecutor(workers) as ex:
-        return list(ex.map(_open, granules))
+        return [to_relative(v) for v in ex.map(_open, granules)]
+
+
+def to_relative(vds: xr.Dataset) -> xr.Dataset:
+    """Rewrite absolute S3/HTTPS chunk paths to vcc://podaac-swot/<key>."""
+    def _rel(path: str) -> str:
+        for prefix in (HTTPS_PREFIX, S3_PREFIX):
+            if path.startswith(prefix):
+                return VCC_ROOT + path[len(prefix):]
+        raise ValueError(f"chunk path outside the SWOT bucket: {path}")
+    return vds.vz.rename_paths(_rel)
 
 
 def check_consistent(vdss: list[xr.Dataset], granules: list[Granule]) -> None:
@@ -167,127 +196,144 @@ def check_consistent(vdss: list[xr.Dataset], granules: list[Granule]) -> None:
 
 
 # --------------------------------------------------------------------------- cube blocks
+#
+# Built from public xarray / VirtualiZarr operations:
+#   lift        -- expand_dims gives one granule its (cycle, pass_number) slot
+#   combine     -- xr.combine_by_coords stacks lifted granules of consecutive passes
+#   empty_cube  -- the full-extent template: every slot a null chunk reference
+# Holes are never padded in: the template already holds null references everywhere,
+# and region writes (region="auto", located by label) only touch the slots they cover.
+# (Padding with reindex also works -- VirtualiZarr turns alignment fills into null
+# references -- but xarray and VirtualiZarr build element-level masks for it, which is
+# prohibitive at cube scale: ~4e9 elements per variable for 10 cycles x 584 passes.)
+# While blocks are assembled, coordinates are held as data variables; write()
+# restores them as coordinates.
 
-def _stack_manifest(
-    ref: ManifestArray, members: np.ndarray, lead_dims: tuple[str, ...], dims: tuple[str, ...]
-) -> ManifestArray:
-    """Stack single-granule ManifestArrays into an array with extra leading dims.
+CUBE_COORDS = ["latitude", "longitude", "latitude_nadir", "longitude_nadir",
+               "granule_present", "filename", "crid", *GRANULE_ATTRS]
 
-    `members` is an object array of shape `lead_shape` holding ManifestArray or None.
-    None slots become empty (null) chunk references.
-    """
-    lead_shape = members.shape
-    grid = ref.manifest.shape_chunk_grid
-    paths = np.full(lead_shape + grid, "", dtype=np.dtypes.StringDType())
-    offsets = np.zeros(lead_shape + grid, dtype=np.uint64)
-    lengths = np.zeros(lead_shape + grid, dtype=np.uint64)
-    for idx in np.ndindex(lead_shape):
-        ma = members[idx]
-        if ma is not None:
-            paths[idx] = ma.manifest._paths
-            offsets[idx] = ma.manifest._offsets
-            lengths[idx] = ma.manifest._lengths
-    manifest = ChunkManifest.from_arrays(paths=paths, offsets=offsets, lengths=lengths)
-    metadata = copy_and_replace_metadata(
-        ref.metadata,
-        new_shape=list(lead_shape) + list(ref.shape),
-        new_chunks=[1] * len(lead_shape) + list(ref.metadata.chunks),
-        new_dimension_names=lead_dims + dims,
-    )
-    return ManifestArray(metadata=metadata, chunkmanifest=manifest)
+# fill values for empty slots (virtual arrays always read their own fill value)
+GRANULE_FILL = {"granule_present": False, "filename": "", "crid": ""} | {
+    k: (np.datetime64("NaT", "ns") if kind == "time" else np.nan)
+    for k, (_, kind) in GRANULE_ATTRS.items()
+}
+
+# explicit encoding: float seconds with NaN fill, so NaT (holes) round-trips and
+# every region write encodes times identically
+TIME_ENC = {"units": "seconds since 2000-01-01 00:00:00", "calendar": "proleptic_gregorian",
+            "dtype": "float64", "_FillValue": np.nan}
 
 
-def build_block(
-    cycles: list[int],
-    passes: list[int],
-    slots: dict[tuple[int, int], tuple[Granule, xr.Dataset]],
-    ref: xr.Dataset,
-) -> xr.Dataset:
-    """Virtual dataset for the block cycles x passes. Missing slots are null refs.
-
-    `ref` is any parsed granule; it supplies metadata/attrs for every variable
-    (check_consistent guarantees they agree).
-    """
-    nc, npass = len(cycles), len(passes)
-    ci = {c: i for i, c in enumerate(cycles)}
-    pi = {p: i for i, p in enumerate(passes)}
-
-    variables = {}
-    for name, rv in ref.variables.items():
-        if name in GRID_VARS:
-            members = np.full((npass,), None, dtype=object)
-            for (c, p), (_, vds) in sorted(slots.items()):  # first cycle present wins
-                if members[pi[p]] is None:
-                    members[pi[p]] = vds[name].data
-            lead = ("pass_number",)
+def _granule_fields(g: Granule, vds: xr.Dataset) -> dict:
+    """Per-granule values (from the filename and global attrs) as (1, 1) arrays."""
+    vals = {"granule_present": True, "filename": g.filename, "crid": g.crid}
+    for k, (attr, kind) in GRANULE_ATTRS.items():
+        val = vds.attrs.get(attr)
+        if val is None or (isinstance(val, str) and not val.strip()):
+            vals[k] = GRANULE_FILL[k]
+        elif kind == "time":
+            vals[k] = np.datetime64(pd.Timestamp(str(val).rstrip("Z")).to_datetime64(), "ns")
         else:
-            members = np.full((nc, npass), None, dtype=object)
-            for (c, p), (_, vds) in slots.items():
-                members[ci[c], pi[p]] = vds[name].data
-            lead = LEAD
-        variables[name] = xr.Variable(
-            lead + rv.dims,
-            _stack_manifest(rv.data, members, lead, rv.dims),
-            attrs=rv.attrs,
-            encoding=rv.encoding,
-        )
+            vals[k] = float(val)
+    return {k: (LEAD, np.array([[v]], dtype=object if isinstance(v, str) else None))
+            for k, v in vals.items()}
 
-    coords = {"cycle": ("cycle", np.asarray(cycles, dtype="int32")),
-              "pass_number": ("pass_number", np.asarray(passes, dtype="int32"))}
-    coords.update(_granule_coords(cycles, passes, slots))
-    coord_names = set(ref.coords) | set(GRID_VARS)
 
-    ds = xr.Dataset(
-        {k: v for k, v in variables.items() if k not in coord_names},
-        coords={**coords, **{k: v for k, v in variables.items() if k in coord_names}},
-        attrs={k: ref.attrs[k] for k in KEEP_ATTRS if k in ref.attrs}
-        | {"cube_layout": "(cycle, pass_number) science-phase cube; see swot_cube.py"},
+def lift(g: Granule, vds: xr.Dataset) -> xr.Dataset:
+    """One parsed granule -> a (1, 1) block at its (cycle, pass_number) slot.
+
+    Swath lat/lon get only the pass_number dim (fixed grid per pass).
+    Dataset.expand_dims skips coordinates, so they are demoted to data vars first.
+    """
+    flat = vds.reset_coords()
+    grid = flat[GRID_VARS].expand_dims(pass_number=[g.pass_number])
+    rest = flat.drop_vars(GRID_VARS).expand_dims(cycle=[g.cycle], pass_number=[g.pass_number])
+    out = xr.merge([rest, grid], join="exact", combine_attrs="drop_conflicts")
+    out = out.assign(_granule_fields(g, vds))
+    out.attrs = {k: vds.attrs[k] for k in KEEP_ATTRS if k in vds.attrs} | {
+        "cube_layout": "(cycle, pass_number) science-phase cube; see swot_cube.py"}
+    return out
+
+
+def combine(blocks: list[xr.Dataset]) -> xr.Dataset:
+    """Stack lifted granules by their cycle/pass_number labels (outer join: gaps are holes)."""
+    return xr.combine_by_coords(
+        blocks, data_vars="all", coords="minimal", compat="override",
+        join="outer", combine_attrs="override", fill_value=GRANULE_FILL,
     )
-    return ds
 
 
-def _granule_coords(cycles, passes, slots) -> dict:
-    shape = (len(cycles), len(passes))
-    ci = {c: i for i, c in enumerate(cycles)}
-    pi = {p: i for i, p in enumerate(passes)}
-    present = np.zeros(shape, bool)
-    filename = np.full(shape, "", dtype=object)
-    crid = np.full(shape, "", dtype=object)
-    extra = {
-        k: np.full(shape, np.datetime64("NaT", "ns") if kind == "time" else np.nan)
-        for k, (_, kind) in GRANULE_ATTRS.items()
-    }
-    for (c, p), (g, vds) in slots.items():
-        idx = (ci[c], pi[p])
-        present[idx] = True
-        filename[idx] = g.filename
-        crid[idx] = g.crid
-        for k, (attr, kind) in GRANULE_ATTRS.items():
-            val = vds.attrs.get(attr)
-            if val is None or (isinstance(val, str) and not val.strip()):
-                continue
-            if kind == "time":
-                extra[k][idx] = pd.Timestamp(str(val).rstrip("Z")).to_datetime64()
-            else:
-                extra[k][idx] = float(val)
-    out = {"granule_present": (LEAD, present), "filename": (LEAD, filename),
-           "crid": (LEAD, crid)}
-    # explicit encoding: float seconds with NaN fill, so NaT (holes) round-trips and
-    # every region write encodes times identically
-    time_enc = {"units": "seconds since 2000-01-01 00:00:00", "calendar": "proleptic_gregorian",
-                "dtype": "float64", "_FillValue": np.nan}
-    for k, v in extra.items():
-        kind = GRANULE_ATTRS[k][1]
-        out[k] = xr.Variable(LEAD, v, encoding=time_enc if kind == "time" else {})
+def empty_cube(like: xr.Dataset, cycles: list[int], passes: list[int]) -> xr.Dataset:
+    """Template covering cycles x passes with no chunk references at all.
+
+    `like` is any lifted granule. Virtual arrays keep its zarr metadata (codecs, chunks)
+    with the leading dims resized and an empty manifest; granule fields get fill values.
+    Cost scales with the number of chunks, not elements.
+    """
+    sizes = {"cycle": len(cycles), "pass_number": len(passes)}
+    variables = {}
+    for name, var in like.data_vars.items():
+        shape = tuple(sizes.get(d, n) for d, n in zip(var.dims, var.shape))
+        if isinstance(var.data, ManifestArray):
+            meta = copy_and_replace_metadata(var.data.metadata, new_shape=list(shape))
+            # the granule's own chunk grid, with the cycle/pass_number entries resized
+            grid = tuple(sizes.get(d, g) for d, g in zip(var.dims, var.data.manifest.shape_chunk_grid))
+            data = ManifestArray(metadata=meta, chunkmanifest=ChunkManifest(entries={}, shape=grid))
+        else:
+            data = np.full(shape, GRANULE_FILL[name], dtype=var.dtype)
+        variables[name] = xr.Variable(var.dims, data, attrs=var.attrs, encoding=var.encoding)
+    return xr.Dataset(variables, coords={"cycle": cycles, "pass_number": passes}, attrs=like.attrs)
+
+
+def _finalize(block: xr.Dataset) -> xr.Dataset:
+    """Restore coordinates and pin encodings before writing."""
+    out = block.set_coords([c for c in CUBE_COORDS if c in block])
+    for k, (_, kind) in GRANULE_ATTRS.items():
+        if kind == "time" and k in out:
+            out[k].encoding = dict(TIME_ENC)
     return out
 
 
 # --------------------------------------------------------------------------- icechunk
 
-def _container(headers: dict | None = None) -> icechunk.VirtualChunkContainer:
+def _s3_container() -> icechunk.VirtualChunkContainer:
+    """Canonical container saved in the repo: S3, no credentials."""
     return icechunk.VirtualChunkContainer(
-        url_prefix=HTTPS_PREFIX, store=icechunk.http_store(headers=headers)
+        url_prefix=S3_PREFIX, store=icechunk.s3_store(region="us-west-2"), name=VCC_NAME
     )
+
+
+def _https_container(auth: Auth) -> icechunk.VirtualChunkContainer:
+    """Read-time override of the same-named container: HTTPS archive + EDL bearer header.
+
+    Never persist a config holding this container, and never print/display the
+    repo config after applying it -- its repr shows the bearer token.
+    """
+    return icechunk.VirtualChunkContainer(
+        url_prefix=HTTPS_PREFIX,
+        store=icechunk.http_store(headers=http_client_options(auth)["default_headers"]),
+        name=VCC_NAME,
+    )
+
+
+def _assert_relative(vds: xr.Dataset) -> None:
+    for name, var in vds.variables.items():
+        if isinstance(var.data, ManifestArray):
+            for path in var.data.manifest.iter_nonempty_paths():
+                if not path.startswith(VCC_ROOT):
+                    raise ValueError(f"{name}: absolute chunk path {path!r}; expected {VCC_ROOT}...")
+
+
+def write(vds: xr.Dataset, store: icechunk.IcechunkStore, **kwargs) -> None:
+    """to_icechunk for relative refs.
+
+    VirtualiZarr's container validation does not understand vcc:// locations, so it
+    is disabled and replaced by a check that every reference is relative to the
+    podaac-swot container.
+    """
+    vds = _finalize(vds)
+    _assert_relative(vds)
+    vds.vz.to_icechunk(store, validate_containers=False, **kwargs)
 
 
 def create_repo(path: str | Path, overwrite: bool = False) -> icechunk.Repository:
@@ -297,62 +343,79 @@ def create_repo(path: str | Path, overwrite: bool = False) -> icechunk.Repositor
         import shutil
         shutil.rmtree(path)
     config = icechunk.RepositoryConfig.default()
-    config.set_virtual_chunk_container(_container())
+    config.set_virtual_chunk_container(_s3_container())
     return icechunk.Repository.create(icechunk.local_filesystem_storage(str(path)), config)
 
 
-def open_repo(path: str | Path, token: str) -> icechunk.Repository:
-    """Open for reading; the Earthdata token is injected at runtime only."""
-    config = icechunk.RepositoryConfig.default()
-    config.set_virtual_chunk_container(
-        _container(headers={"authorization": f"Bearer {token}"})
-    )
-    return icechunk.Repository.open(
-        icechunk.local_filesystem_storage(str(path)),
-        config=config,
-        authorize_virtual_chunk_access={HTTPS_PREFIX: icechunk.Credentials.HttpAccess()},
-    )
+def open_repo(path: str | Path, auth: Auth, access: str = "https") -> icechunk.Repository:
+    """Open for reading over "https" (anywhere) or "s3" (in us-west-2 only).
+
+    https: the podaac-swot container is overridden with the HTTPS archive and the
+        earthaccess-auth bearer header, via a config override that is never
+        persisted. Headers are static: EDL tokens last ~60 days, so long-lived
+        readers should log in again and reopen.
+    s3: the stored S3 container is used as-is, authorized with earthaccess-auth's
+        refreshable per-bucket credentials. (Untested outside us-west-2.)
+    """
+    storage = icechunk.local_filesystem_storage(str(path))
+    if access == "https":
+        config = icechunk.RepositoryConfig.default()
+        config.set_virtual_chunk_container(_https_container(auth))
+        return icechunk.Repository.open(
+            storage, config=config,
+            authorize_virtual_chunk_access={HTTPS_PREFIX: icechunk.Credentials.HttpAccess()},
+        )
+    if access == "s3":
+        earthaccess_auth.set_default_auth(auth)  # identity behind the S3 credential fetches
+        repo = icechunk.Repository.open(storage)
+        return repo.reopen(authorize_virtual_chunk_access=earthdata_containers_credentials(repo))
+    raise ValueError(f"access must be 'https' or 's3', not {access!r}")
 
 
-def open_cube(path: str | Path, token: str, branch: str = "main") -> xr.Dataset:
-    repo = open_repo(path, token)
+def open_cube(path: str | Path, auth: Auth, branch: str = "main", access: str = "https") -> xr.Dataset:
+    repo = open_repo(path, auth, access)
     return xr.open_zarr(repo.readonly_session(branch).store, consolidated=False, zarr_format=3)
+
+
+def write_runs(store: icechunk.IcechunkStore, lifted: dict[tuple[int, int], xr.Dataset]) -> None:
+    """Region-write lifted granules, one write per run of consecutive passes in a cycle.
+
+    Slots are located by label (region="auto"). Runs are never padded, so slots between
+    runs -- holes, or granules already in the cube -- and their granule coords are not touched.
+    """
+    for c in sorted({k[0] for k in lifted}):
+        for run in _runs([p for (cc, p) in lifted if cc == c]):
+            write(combine([lifted[(c, p)] for p in run]), store,
+                  region={"cycle": "auto", "pass_number": "auto"})
+            print(f"  cycle {c} passes {run[0]}-{run[-1]}: wrote {len(run)} granules")
 
 
 # --------------------------------------------------------------------------- build
 
 def build(repo_path: str, cycles: list[int], passes: list[int],
           drop: set[tuple[int, int]] = frozenset(), overwrite: bool = False) -> None:
-    auth = earthaccess.login(strategy="netrc")
-    token = auth.token["access_token"]
+    auth = login()
 
     granules = [g for g in find_granules(cycles, passes)
                 if (g.cycle, g.pass_number) not in drop]
     print(f"found {len(granules)} granules for {len(cycles)} cycles x {len(passes)} passes"
           f" (dropped {len(drop)} on purpose)")
-    vdss = parse_granules(granules, token)
+    vdss = parse_granules(granules, auth)
     check_consistent(vdss, granules)
-    ref = vdss[0]
-    slots = {(g.cycle, g.pass_number): (g, v) for g, v in zip(granules, vdss)}
+    lifted = [lift(g, v) for g, v in zip(granules, vdss)]
 
     repo = create_repo(repo_path, overwrite=overwrite)
     all_passes = list(range(1, N_PASSES + 1))
 
-    # 1. template: full extent, no references at all
+    # 1. template: every cycle x all 584 passes, no references
     session = repo.writable_session("main")
-    build_block(cycles, all_passes, {}, ref).vz.to_icechunk(session.store, mode="w")
+    write(empty_cube(lifted[0], cycles, all_passes), session.store, mode="w")
     session.commit("template: empty (cycle, pass_number) cube")
 
-    # 2. one region write per cycle
+    # 2. per cycle, per run of consecutive passes: combine and write by label
     session = repo.writable_session("main")
-    for i, c in enumerate(cycles):
-        cyc_slots = {k: v for k, v in slots.items() if k[0] == c}
-        block = build_block([c], all_passes, cyc_slots, ref)
-        block.vz.to_icechunk(
-            session.store,
-            region={"cycle": slice(i, i + 1), "pass_number": slice(0, N_PASSES)},
-        )
-        print(f"  cycle {c}: wrote {len(cyc_slots)} granules")
+    by_slot = {(g.cycle, g.pass_number): b for g, b in zip(granules, lifted)}
+    write_runs(session.store, by_slot)
     print("commit:", session.commit(f"fill cycles {cycles[0]}-{cycles[-1]}"))
 
 
@@ -385,7 +448,7 @@ def update(repo_path: str, granules: list[Granule], message: str | None = None) 
     - A slot that already holds a granule is replaced only if the new one ranks higher
       (PGD over PID, then higher product counter); otherwise the granule is skipped.
     """
-    token = earthaccess.login(strategy="netrc").token["access_token"]
+    auth = login()
     repo = icechunk.Repository.open(icechunk.local_filesystem_storage(str(repo_path)))
     session = repo.writable_session("main")
     # read only the small native coords: opening with xarray would decode `time`,
@@ -410,31 +473,21 @@ def update(repo_path: str, granules: list[Granule], message: str | None = None) 
     if min(g.cycle for g in todo) < cycles[0]:
         raise ValueError("granules precede the cube's first cycle; prepending is not supported")
 
-    vdss = parse_granules(todo, token)
+    vdss = parse_granules(todo, auth)
     check_consistent(vdss, todo)
     # compatibility with the arrays already in the cube is enforced by VirtualiZarr's
     # append/region writers (check_compatible_arrays / check_compatible_encodings)
-    ref = vdss[0]
-    slots = {(g.cycle, g.pass_number): (g, v) for g, v in zip(todo, vdss)}
+    lifted = {(g.cycle, g.pass_number): lift(g, v) for g, v in zip(todo, vdss)}
     all_passes = list(range(1, N_PASSES + 1))
 
     # 1. grow the cycle axis with empty slabs
     new_cycles = list(range(cycles[-1] + 1, max(g.cycle for g in todo) + 1))
+    like = next(iter(lifted.values()))
     for c in new_cycles:
-        build_block([c], all_passes, {}, ref).vz.to_icechunk(session.store, append_dim="cycle")
-    cycles += new_cycles
-    ci = {c: i for i, c in enumerate(cycles)}
+        write(empty_cube(like, [c], all_passes), session.store, append_dim="cycle")
 
-    # 2. region-write each run of consecutive passes
-    for c in sorted({k[0] for k in slots}):
-        for run in _runs([p for (cc, p) in slots if cc == c]):
-            run_slots = {(c, p): slots[(c, p)] for p in run}
-            build_block([c], run, run_slots, ref).vz.to_icechunk(
-                session.store,
-                region={"cycle": slice(ci[c], ci[c] + 1),
-                        "pass_number": slice(run[0] - 1, run[-1])},
-            )
-            print(f"  cycle {c} passes {run[0]}-{run[-1]}: wrote {len(run)} granules")
+    # 2. region-write each run of consecutive passes, located by label
+    write_runs(session.store, lifted)
 
     msg = message or (f"update: {len(todo)} granules"
                       + (f", new cycles {new_cycles}" if new_cycles else ""))

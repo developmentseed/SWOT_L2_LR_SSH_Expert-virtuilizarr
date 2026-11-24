@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11,<3.13"
-# dependencies = ["earthaccess", "obstore", "obspec-utils", "xarray", "h5netcdf", "h5py", "numpy", "pandas"]
+# dependencies = ["earthaccess", "earthaccess-auth[obstore]", "obstore", "obspec-utils", "xarray", "h5netcdf", "h5py", "numpy", "pandas"]
 # ///
 """Is the SWOT L2 LR SSH Expert (version D) grid fixed cycle to cycle?
 
@@ -17,11 +17,13 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-import earthaccess
+import earthaccess  # CMR granule search only
+import earthaccess_auth
 import numpy as np
 import pandas as pd
 import xarray as xr
 from obspec_utils.readers import EagerStoreReader
+from earthaccess_auth.adapters.obstore import http_client_options
 from obstore.store import HTTPStore
 
 SHORT_NAME = "SWOT_L2_LR_SSH_EXPERT_D"
@@ -105,9 +107,7 @@ def check_pass(pass_num):
 
 
 if __name__ == "__main__":
-    token = earthaccess.login(strategy="netrc").token["access_token"]
-    _store = HTTPStore.from_url(
-        HTTPS_HOST, client_options={"default_headers": {"Authorization": f"Bearer {token}"}}
-    )
+    auth = earthaccess_auth.login(strategy="netrc")
+    _store = HTTPStore.from_url(HTTPS_HOST, client_options=http_client_options(auth))
     for p in PASSES:
         check_pass(p)
